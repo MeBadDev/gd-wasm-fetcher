@@ -28,6 +28,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -338,6 +339,14 @@ def process_release(entry: Dict, dest_root: Path, token: Optional[str]) -> bool:
 	asset_name = asset.get("name")
 	asset_url = asset.get("browser_download_url")
 	if meta and meta.get("asset_id") == asset_id:
+		# Even if metadata matches, ensure post-processing (opt/gzip) exists
+		pp = post_process_version_dir(version_dir)
+		if pp.get("gz_files") or pp.get("optimized"):
+			# refresh metadata hashes if files changed due to optimization/gzip
+			present_files = collect_present_web_files(version_dir)
+			meta["files"] = present_files
+			meta["post_process"] = pp
+			save_json(meta_path, meta)
 		logging.info("%s already up-to-date, skipping", tag)
 		return False
 
@@ -354,10 +363,18 @@ def process_release(entry: Dict, dest_root: Path, token: Optional[str]) -> bool:
 			"fetched_at": int(time.time()),
 			"files": present_files,
 		}
+		# Run post-processing then save
+		pp = post_process_version_dir(version_dir)
+		out["post_process"] = pp
 		save_json(meta_path, out)
 		logging.info("%s files already present; wrote metadata and skipped download", tag)
 		return False
 	elif present_files and meta:
+		pp = post_process_version_dir(version_dir)
+		if pp.get("gz_files") or pp.get("optimized"):
+			meta["files"] = collect_present_web_files(version_dir)
+			meta["post_process"] = pp
+			save_json(meta_path, meta)
 		logging.info("%s files already present; skipping download", tag)
 		return False
 
@@ -366,6 +383,8 @@ def process_release(entry: Dict, dest_root: Path, token: Optional[str]) -> bool:
 		tpz_path = Path(td) / asset_name
 		http_download(asset_url, tpz_path, token=token)
 		files = extract_web_artifacts(tpz_path, version_dir)
+		# Post-process after extraction
+		pp = post_process_version_dir(version_dir)
 	out = {
 		"tag": tag,
 		"version": str(ver),
@@ -375,6 +394,7 @@ def process_release(entry: Dict, dest_root: Path, token: Optional[str]) -> bool:
 		"published_at": entry["release"].get("published_at"),
 		"fetched_at": int(time.time()),
 		"files": files,
+		"post_process": pp,
 	}
 	save_json(meta_path, out)
 	logging.info("%s processed: %d files", tag, len(out["files"]))
@@ -392,6 +412,87 @@ def build_index(dest_root: Path):
 			continue
 		index[str(child.name)] = meta
 	save_json(dest_root / "index.json", index)
+
+
+def which(cmd: str) -> Optional[str]:
+	return shutil.which(cmd)
+
+
+def optimize_wasm_with_wasm_opt(wasm_path: Path) -> Tuple[bool, Optional[str]]:
+	"""Optimize a wasm in-place using wasm-opt if available.
+	Returns (optimized, tool_path). Optimizes to a temp file and replaces if smaller.
+	"""
+	wasm_opt = which("wasm-opt")
+	if not wasm_opt:
+		return False, None
+	tmp_out = wasm_path.with_suffix(wasm_path.suffix + ".opt")
+	try:
+		res = subprocess.run([wasm_opt, "-Oz", "--strip-debug", "-o", str(tmp_out), str(wasm_path)],
+							 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+		if res.returncode != 0:
+			logging.debug("wasm-opt failed on %s: %s", wasm_path, res.stderr.strip())
+			if tmp_out.exists():
+				tmp_out.unlink(missing_ok=True)
+			return False, wasm_opt
+		# Replace only if size improves or original missing
+		if not wasm_path.exists() or tmp_out.stat().st_size < wasm_path.stat().st_size:
+			tmp_out.replace(wasm_path)
+			return True, wasm_opt
+		else:
+			tmp_out.unlink(missing_ok=True)
+			return False, wasm_opt
+	except Exception as e:
+		logging.debug("wasm-opt exception on %s: %s", wasm_path, e)
+		try:
+			tmp_out.unlink(missing_ok=True)
+		except Exception:
+			pass
+		return False, wasm_opt
+
+
+def gzip_file(path: Path) -> Optional[Path]:
+	import gzip
+	gz_path = path.with_suffix(path.suffix + ".gz")
+	try:
+		# If gz exists and source is older or same mtime, skip
+		if gz_path.exists() and path.exists() and gz_path.stat().st_mtime >= path.stat().st_mtime and gz_path.stat().st_size > 0:
+			return gz_path
+		with open(path, "rb") as src, gzip.open(gz_path, "wb", compresslevel=9, mtime=0) as dst:
+			shutil.copyfileobj(src, dst)
+		# Align mtime to source for caching semantics
+		try:
+			os.utime(gz_path, (path.stat().st_atime, path.stat().st_mtime))
+		except Exception:
+			pass
+		return gz_path
+	except Exception as e:
+		logging.debug("gzip failed for %s: %s", path, e)
+		return None
+
+
+def post_process_version_dir(version_dir: Path) -> Dict[str, any]:
+	"""Optimize wasm with binaryen (if available) and gzip wasm/js.
+	Returns a dict summary: {optimized: bool, wasm_opt_path: str|None, gz: [names]}
+	"""
+	optimized_any = False
+	wasm_opt_path: Optional[str] = None
+	gz_files: List[str] = []
+	# Optimize wasm files
+	for wasm in sorted(version_dir.glob("*.wasm")):
+		opt, tool = optimize_wasm_with_wasm_opt(wasm)
+		optimized_any = optimized_any or opt
+		if tool:
+			wasm_opt_path = tool
+	# Gzip wasm+js files
+	for f in sorted(list(version_dir.glob("*.wasm")) + list(version_dir.glob("*.js"))):
+		gz = gzip_file(f)
+		if gz:
+			gz_files.append(gz.name)
+	return {
+		"optimized": optimized_any,
+		"wasm_opt_path": wasm_opt_path,
+		"gz_files": gz_files,
+	}
 
 
 def main(argv: Optional[List[str]] = None) -> int:
