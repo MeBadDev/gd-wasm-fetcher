@@ -1,0 +1,1 @@
+This project downloads Godot HTML export's WebAssembly and JS files for version 3.0 to 4.5 from Github Releases and stores them.
