@@ -225,24 +225,39 @@ def extract_web_artifacts(tpz_path: Path, dest_dir: Path) -> List[Dict[str, str]
 	Returns a list of {"name": <filename>, "sha256": <hash>} entries.
 	"""
 	extracted: List[Dict[str, str]] = []
-	def add_file_from_stream(base: str, stream, used_names: Dict[str, int]):
-		# Resolve duplicate basenames (rare)
-		if base in used_names:
-			used_names[base] += 1
-			name = f"{used_names[base]}_{base}"
-		else:
-			used_names[base] = 0
-			name = base
-		out_path = dest_dir / name
+	def add_file_from_bytes(base: str, data: bytes, existing_hashes: Dict[str, List[Tuple[str, str]]]):
+		# existing_hashes maps basename -> list[(filename, sha256)] already in dest_dir
+		desired_hash = hashlib.sha256(data).hexdigest()
+		# Check if an existing file with same base has identical content
+		for fname, fhash in existing_hashes.get(base, []):
+			if fhash == desired_hash:
+				# Identical file already present; skip writing duplicate
+				return
+		# Determine a unique output name
+		out_name = base
+		if base in existing_hashes:
+			# Only suffix if a different content under same basename exists
+			index = len(existing_hashes[base])
+			if index > 0:
+				out_name = f"{index}_{base}"
+		out_path = dest_dir / out_name
 		out_path.parent.mkdir(parents=True, exist_ok=True)
 		with open(out_path, "wb") as dst:
-			shutil.copyfileobj(stream, dst)
-		extracted.append({"name": name, "sha256": sha256_file(out_path)})
+			dst.write(data)
+		out_hash = sha256_file(out_path)
+		existing_hashes.setdefault(base, []).append((out_name, out_hash))
+		extracted.append({"name": out_name, "sha256": out_hash})
 
 	with zipfile.ZipFile(tpz_path) as zf:
 		members = zf.namelist()
 		# Avoid filename collisions across direct and nested sources
-		used_names: Dict[str, int] = {}
+		existing_hashes: Dict[str, List[Tuple[str, str]]] = {}
+		for p in dest_dir.glob("*.wasm"):
+			base = p.name
+			existing_hashes.setdefault(base, []).append((p.name, sha256_file(p)))
+		for p in dest_dir.glob("*.js"):
+			base = p.name
+			existing_hashes.setdefault(base, []).append((p.name, sha256_file(p)))
 
 		# 1) Direct files in templates/ that are wasm/js
 		for m in members:
@@ -252,7 +267,8 @@ def extract_web_artifacts(tpz_path: Path, dest_dir: Path) -> List[Dict[str, str]
 			if not base:
 				continue
 			with zf.open(m) as src:
-				add_file_from_stream(base, src, used_names)
+				data = src.read()
+				add_file_from_bytes(base, data, existing_hashes)
 
 		# 2) Nested HTML/web zips in templates/ (common in 3.x: html.zip, webassembly.zip)
 		for m in members:
@@ -274,7 +290,8 @@ def extract_web_artifacts(tpz_path: Path, dest_dir: Path) -> List[Dict[str, str]
 							if not base:
 								continue
 							with inner.open(name) as src2:
-								add_file_from_stream(base, src2, used_names)
+								data2 = src2.read()
+								add_file_from_bytes(base, data2, existing_hashes)
 			except Exception as e:
 				logging.debug("Skipping nested zip %s due to error: %s", m, e)
 	return extracted
@@ -295,6 +312,17 @@ def load_json(path: Path) -> Optional[Dict]:
 		return None
 
 
+def collect_present_web_files(version_dir: Path) -> List[Dict[str, str]]:
+	"""Collect existing .wasm and .js files from a version directory with hashes."""
+	files: List[Dict[str, str]] = []
+	if not version_dir.exists():
+		return files
+	for p in sorted(list(version_dir.glob("*.wasm")) + list(version_dir.glob("*.js"))):
+		if p.is_file():
+			files.append({"name": p.name, "sha256": sha256_file(p)})
+	return files
+
+
 def process_release(entry: Dict, dest_root: Path, token: Optional[str]) -> bool:
 	"""Process a single release entry.
 	Returns True if new work was done, False if skipped.
@@ -311,6 +339,26 @@ def process_release(entry: Dict, dest_root: Path, token: Optional[str]) -> bool:
 	asset_url = asset.get("browser_download_url")
 	if meta and meta.get("asset_id") == asset_id:
 		logging.info("%s already up-to-date, skipping", tag)
+		return False
+
+	# If files already present for this version, skip downloading and ensure metadata exists.
+	present_files = collect_present_web_files(version_dir)
+	if present_files and not meta:
+		out = {
+			"tag": tag,
+			"version": str(ver),
+			"asset_id": None,
+			"asset_name": None,
+			"asset_url": None,
+			"published_at": entry["release"].get("published_at"),
+			"fetched_at": int(time.time()),
+			"files": present_files,
+		}
+		save_json(meta_path, out)
+		logging.info("%s files already present; wrote metadata and skipped download", tag)
+		return False
+	elif present_files and meta:
+		logging.info("%s files already present; skipping download", tag)
 		return False
 
 	logging.info("Downloading %s -> %s", asset_name, version_dir)
