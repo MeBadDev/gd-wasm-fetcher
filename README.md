@@ -2,7 +2,7 @@
 This project discovers all stable Godot releases (>= 3.0) on GitHub and downloads the HTML export's WebAssembly and JS files for each version.
 
 # Requirements
-* Python >= 3.10.17
+* Tested on Python 3.10.17, probably works on other version but duh, just use 3.10.17
 
 ## Usage
 
@@ -25,9 +25,8 @@ Edit crontab:
 	crontab -e
 
 Nightly at 02:30, with a Python venv and optional token:
-	30 2 * * * cd /home/youruser/ProgrammingProjects/gd-wasm-fetcher && \
+	30 2 * * * cd /gd-wasm-fetcher && \
 		/usr/bin/env -S bash -lc 'source env/bin/activate && export GITHUB_TOKEN=... && python main.py --dest ./store --log INFO >> fetch.log 2>&1'
 
 Notes
 - No external dependencies. Uses GitHub API for discovery; falls back to rate-limited access if no token.
-- Idempotent: skips versions already processed unless the upstream asset changed (tracked by asset_id in metadata.json).
