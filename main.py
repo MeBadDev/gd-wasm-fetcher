@@ -24,6 +24,7 @@ import hashlib
 import json
 import io
 import logging
+import gzip
 import os
 from pathlib import Path
 import re
@@ -33,6 +34,7 @@ import sys
 import tempfile
 import time
 import zipfile
+import subprocess
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
@@ -209,20 +211,18 @@ WEB_PATH_HINTS = (
 )
 
 
-def is_web_file(path: str) -> bool:
+def is_web_path(path: str) -> bool:
 	p = path.lower()
 	if not p.startswith("templates/"):
 		return False
 	if "/mono/" in p:
 		return False
-	if not (p.endswith(".wasm") or p.endswith(".js")):
-		return False
-	# Must also live under a web-related path or be clearly wasm/js in templates
-	return any(h in p for h in WEB_PATH_HINTS) or p.endswith(".wasm") or p.endswith(".js")
+	# Anything under a web-related path is considered part of web export
+	return any(h in p for h in WEB_PATH_HINTS)
 
 
 def extract_web_artifacts(tpz_path: Path, dest_dir: Path) -> List[Dict[str, str]]:
-	"""Extract WASM/JS files from the export templates archive into dest_dir.
+	"""Extract all web export assets from the export templates archive into dest_dir.
 	Returns a list of {"name": <filename>, "sha256": <hash>} entries.
 	"""
 	extracted: List[Dict[str, str]] = []
@@ -259,13 +259,27 @@ def extract_web_artifacts(tpz_path: Path, dest_dir: Path) -> List[Dict[str, str]
 		for p in dest_dir.glob("*.js"):
 			base = p.name
 			existing_hashes.setdefault(base, []).append((p.name, sha256_file(p)))
+		for p in dest_dir.glob("*.html"):
+			existing_hashes.setdefault(p.name, []).append((p.name, sha256_file(p)))
+		for p in dest_dir.glob("*.htm"):
+			existing_hashes.setdefault(p.name, []).append((p.name, sha256_file(p)))
+		for p in dest_dir.glob("*.css"):
+			existing_hashes.setdefault(p.name, []).append((p.name, sha256_file(p)))
+		for p in dest_dir.glob("*.png"):
+			existing_hashes.setdefault(p.name, []).append((p.name, sha256_file(p)))
+		for p in dest_dir.glob("*.svg"):
+			existing_hashes.setdefault(p.name, []).append((p.name, sha256_file(p)))
+		for p in dest_dir.glob("*.ico"):
+			existing_hashes.setdefault(p.name, []).append((p.name, sha256_file(p)))
+		for p in dest_dir.glob("*.pck"):
+			existing_hashes.setdefault(p.name, []).append((p.name, sha256_file(p)))
 
-		# 1) Direct files in templates/ that are wasm/js
+		# 1) Direct files in templates/ that live under a web path
 		for m in members:
-			if not is_web_file(m):
+			if not is_web_path(m):
 				continue
 			base = os.path.basename(m)
-			if not base:
+			if not base or m.endswith("/"):
 				continue
 			with zf.open(m) as src:
 				data = src.read()
@@ -285,17 +299,79 @@ def extract_web_artifacts(tpz_path: Path, dest_dir: Path) -> List[Dict[str, str]
 					data = src.read()
 				with zipfile.ZipFile(io.BytesIO(data)) as inner:
 					for name in inner.namelist():
-						nl = name.lower()
-						if nl.endswith(".wasm") or nl.endswith(".js"):
-							base = os.path.basename(name)
-							if not base:
-								continue
-							with inner.open(name) as src2:
-								data2 = src2.read()
-								add_file_from_bytes(base, data2, existing_hashes)
+						if name.endswith("/"):
+							continue
+						base = os.path.basename(name)
+						if not base:
+							continue
+						with inner.open(name) as src2:
+							data2 = src2.read()
+							add_file_from_bytes(base, data2, existing_hashes)
 			except Exception as e:
 				logging.debug("Skipping nested zip %s due to error: %s", m, e)
 	return extracted
+
+
+def find_executable(name: str) -> Optional[str]:
+	path = shutil.which(name)
+	return path
+
+
+def optimize_wasm_in_dir(version_dir: Path, tool: Optional[str] = None) -> List[str]:
+	"""Optimize .wasm files in version_dir using wasm-opt if available.
+	Returns list of files optimized.
+	"""
+	optimized: List[str] = []
+	wasm_opt = tool or find_executable("wasm-opt")
+	if not wasm_opt:
+		logging.info("wasm-opt not found; skipping wasm optimization")
+		return optimized
+	for wasm in version_dir.glob("*.wasm"):
+		tmp_out = wasm.with_suffix(".opt.wasm")
+		try:
+			res = subprocess.run([wasm_opt, "-O3", "-o", str(tmp_out), str(wasm)], capture_output=True, text=True)
+			if res.returncode != 0:
+				logging.warning("wasm-opt failed on %s: %s", wasm.name, res.stderr.strip())
+				if tmp_out.exists():
+					tmp_out.unlink()
+				continue
+			# Replace original with optimized
+			tmp_out.replace(wasm)
+			optimized.append(wasm.name)
+		except Exception as e:
+			logging.warning("wasm-opt error on %s: %s", wasm.name, e)
+			if tmp_out.exists():
+				tmp_out.unlink()
+	return optimized
+
+
+GZIP_EXTS = {".js", ".mjs", ".cjs", ".json", ".html", ".htm", ".css", ".wasm"}
+
+
+def ensure_gzip_in_dir(version_dir: Path) -> List[str]:
+	"""Create .gz alongside source files for common web/text assets and wasm.
+	Skips if .gz exists and is newer than source.
+	Returns list of .gz files created/updated.
+	"""
+	updated: List[str] = []
+	for p in version_dir.iterdir():
+		if not p.is_file():
+			continue
+		if p.suffix.lower() not in GZIP_EXTS:
+			continue
+		gz = p.with_suffix(p.suffix + ".gz")
+		try:
+			if gz.exists() and gz.stat().st_mtime >= p.stat().st_mtime:
+				continue
+			with open(p, "rb") as f_in:
+				data = f_in.read()
+			# Deterministic gzip with mtime=0
+			with gzip.open(gz, "wb", compresslevel=9, mtime=0) as f_out:
+				f_out.write(data)
+			updated.append(gz.name)
+		except Exception as e:
+			logging.warning("gzip failed for %s: %s", p.name, e)
+	return updated
 
 
 def save_json(path: Path, data: Dict):
@@ -314,17 +390,20 @@ def load_json(path: Path) -> Optional[Dict]:
 
 
 def collect_present_web_files(version_dir: Path) -> List[Dict[str, str]]:
-	"""Collect existing .wasm and .js files from a version directory with hashes."""
+	"""Collect existing extracted files (excluding metadata and .gz) with hashes."""
 	files: List[Dict[str, str]] = []
 	if not version_dir.exists():
 		return files
-	for p in sorted(list(version_dir.glob("*.wasm")) + list(version_dir.glob("*.js"))):
-		if p.is_file():
-			files.append({"name": p.name, "sha256": sha256_file(p)})
+	for p in sorted(version_dir.iterdir()):
+		if not p.is_file():
+			continue
+		if p.name == "metadata.json" or p.suffix == ".gz":
+			continue
+		files.append({"name": p.name, "sha256": sha256_file(p)})
 	return files
 
 
-def process_release(entry: Dict, dest_root: Path, token: Optional[str]) -> bool:
+def process_release(entry: Dict, dest_root: Path, token: Optional[str], force_reextract: bool = False) -> bool:
 	"""Process a single release entry.
 	Returns True if new work was done, False if skipped.
 	"""
@@ -338,7 +417,7 @@ def process_release(entry: Dict, dest_root: Path, token: Optional[str]) -> bool:
 	asset_id = asset.get("id")
 	asset_name = asset.get("name")
 	asset_url = asset.get("browser_download_url")
-	if meta and meta.get("asset_id") == asset_id:
+	if not force_reextract and meta and meta.get("asset_id") == asset_id:
 		# Even if metadata matches, ensure post-processing (opt/gzip) exists
 		pp = post_process_version_dir(version_dir)
 		if pp.get("gz_files") or pp.get("optimized"):
@@ -378,6 +457,8 @@ def process_release(entry: Dict, dest_root: Path, token: Optional[str]) -> bool:
 		logging.info("%s files already present; skipping download", tag)
 		return False
 
+	if force_reextract:
+		logging.info("Force re-extract enabled for %s", tag)
 	logging.info("Downloading %s -> %s", asset_name, version_dir)
 	with tempfile.TemporaryDirectory() as td:
 		tpz_path = Path(td) / asset_name
@@ -471,7 +552,7 @@ def gzip_file(path: Path) -> Optional[Path]:
 
 
 def post_process_version_dir(version_dir: Path) -> Dict[str, any]:
-	"""Optimize wasm with binaryen (if available) and gzip wasm/js.
+	"""Optimize wasm with binaryen (if available) and gzip common web assets.
 	Returns a dict summary: {optimized: bool, wasm_opt_path: str|None, gz: [names]}
 	"""
 	optimized_any = False
@@ -483,8 +564,14 @@ def post_process_version_dir(version_dir: Path) -> Dict[str, any]:
 		optimized_any = optimized_any or opt
 		if tool:
 			wasm_opt_path = tool
-	# Gzip wasm+js files
-	for f in sorted(list(version_dir.glob("*.wasm")) + list(version_dir.glob("*.js"))):
+	# Gzip common web/text assets and wasm
+	to_gzip: List[Path] = []
+	for p in sorted(version_dir.iterdir()):
+		if not p.is_file():
+			continue
+		if p.suffix.lower() in GZIP_EXTS:
+			to_gzip.append(p)
+	for f in to_gzip:
 		gz = gzip_file(f)
 		if gz:
 			gz_files.append(gz.name)
@@ -502,6 +589,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 	parser.add_argument("--log", default=os.environ.get("LOG_LEVEL", "INFO"), help="Log level (DEBUG, INFO, WARNING, ERROR)")
 	parser.add_argument("--max-downloads", type=int, default=None, help="Process at most N releases (for testing); default: no limit")
 	parser.add_argument("--list-only", action="store_true", help="List matching releases and exit without downloading")
+	parser.add_argument("--force-reextract", action="store_true", help="Force re-extraction and post-processing even if metadata matches")
 	args = parser.parse_args(argv)
 
 	logging.basicConfig(
@@ -543,7 +631,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 	processed = 0
 	for entry in entries:
 		try:
-			if process_release(entry, dest_root, token):
+			if process_release(entry, dest_root, token, force_reextract=args.force_reextract):
 				changed += 1
 			processed += 1
 			if args.max_downloads is not None and processed >= args.max_downloads:
